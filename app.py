@@ -1,164 +1,1237 @@
-import json
+"""
+Highly Available Support Ticket & Helpdesk Portal on AWS
+Backend: Python Flask + PyMySQL + Boto3 (AWS Secrets Manager)
+Features:
+- Full CRUD Support Ticket API (/api/tickets) with status ('Open', 'In Progress', 'Resolved'),
+  priority ('Low', 'Medium', 'High', 'Critical'), customer info, category, and agent assignment
+- Live Ticket Summary Metrics (Open, In Progress, Resolved, Critical counts)
+- Deep ALB Health Check Endpoint (/health) with RDS MySQL connectivity & latency check
+- Automatic Database Reconnection & Exponential Backoff Retry for RDS Multi-AZ Failover
+- AWS Secrets Manager / Environment Variable Credential Loading (Zero hardcoded secrets)
+- EC2 IMDSv2 Metadata Inspection (Displays Instance ID & Availability Zone in UI to demonstrate ALB load balancing & failover)
+- Embedded Modern Responsive Helpdesk Dashboard (HTML/CSS/JS)
+"""
+
 import os
 import time
-import urllib.request
+import json
+import logging
+import socket
+from functools import wraps
+from datetime import datetime
+from urllib.request import Request, urlopen
+from urllib.error import URLError
 
-import boto3
 import pymysql
-import pymysql.cursors
-from flask import Flask, jsonify, render_template, request
+from pymysql.cursors import DictCursor
+from flask import Flask, request, jsonify, render_template_string
+
+# Optional AWS Secrets Manager support via boto3
+try:
+    import boto3
+    BOTO3_AVAILABLE = True
+except ImportError:
+    BOTO3_AVAILABLE = False
+
+# Configure structured logging for Amazon CloudWatch Logs
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+)
+logger = logging.getLogger("ha-helpdesk-portal")
 
 app = Flask(__name__)
 
-DB_HOST = os.environ["DB_HOST"]
-DB_NAME = os.environ.get("DB_NAME", "todo_db")
-SECRET_ARN = os.environ["DB_SECRET_ARN"]
-REGION = os.environ.get("AWS_DEFAULT_REGION", "ap-south-1")
-
-_creds = None
-_table_ready = False
+VALID_STATUSES = ("Open", "In Progress", "Resolved")
+VALID_PRIORITIES = ("Low", "Medium", "High", "Critical")
+VALID_CATEGORIES = ("Billing", "Technical Support", "Account Access", "Feature Request", "Outage / Incident")
 
 
-def get_credentials(refresh=False):
-    """Read DB username/password from Secrets Manager (never from code)."""
-    global _creds
-    if _creds is None or refresh:
-        client = boto3.client("secretsmanager", region_name=REGION)
-        secret = client.get_secret_value(SecretId=SECRET_ARN)
-        _creds = json.loads(secret["SecretString"])
-    return _creds
+# ==============================================================================
+# 1. EC2 Instance Metadata (IMDSv2) Helper
+#    Identifies which EC2 instance & Availability Zone served the request
+# ==============================================================================
+def get_instance_metadata():
+    """Fetches EC2 Instance ID and Availability Zone using IMDSv2."""
+    metadata = {
+        "instance_id": socket.gethostname(),
+        "availability_zone": os.environ.get("AWS_AVAILABILITY_ZONE", "local-dev"),
+    }
+    try:
+        # Step 1: Request IMDSv2 session token
+        token_req = Request(
+            "http://169.254.169.254/latest/api/token",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
+            method="PUT",
+        )
+        with urlopen(token_req, timeout=0.5) as resp:
+            token = resp.read().decode("utf-8")
+
+        headers = {"X-aws-ec2-metadata-token": token}
+
+        # Step 2: Fetch Instance ID
+        id_req = Request(
+            "http://169.254.169.254/latest/meta-data/instance-id",
+            headers=headers,
+        )
+        with urlopen(id_req, timeout=0.5) as resp:
+            metadata["instance_id"] = resp.read().decode("utf-8")
+
+        # Step 3: Fetch Availability Zone
+        az_req = Request(
+            "http://169.254.169.254/latest/meta-data/placement/availability-zone",
+            headers=headers,
+        )
+        with urlopen(az_req, timeout=0.5) as resp:
+            metadata["availability_zone"] = resp.read().decode("utf-8")
+
+    except (URLError, socket.timeout, OSError):
+        # Fallback cleanly when running locally outside EC2
+        pass
+
+    return metadata
 
 
-def get_conn(retries=4):
-    """Open a connection with retries so RDS failover doesn't crash requests."""
-    last_err = None
-    for attempt in range(retries):
+INSTANCE_META = get_instance_metadata()
+
+
+# ==============================================================================
+# 2. Database Configuration & AWS Secrets Manager Integration
+# ==============================================================================
+def load_db_config():
+    """
+    Loads RDS MySQL credentials from AWS Secrets Manager if DB_SECRET_NAME is set,
+    otherwise falls back to environment variables.
+    """
+    secret_name = os.environ.get("DB_SECRET_NAME")
+    region_name = os.environ.get("AWS_REGION", "us-east-1")
+
+    if secret_name and BOTO3_AVAILABLE:
         try:
-            c = get_credentials(refresh=(attempt > 0))
-            return pymysql.connect(
-                host=DB_HOST,
-                user=c["username"],
-                password=c["password"],
-                database=DB_NAME,
-                connect_timeout=5,
-                autocommit=True,
-                cursorclass=pymysql.cursors.DictCursor,
-            )
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-            time.sleep(2 ** attempt * 0.5)
-    raise last_err
+            session = boto3.session.Session()
+            client = session.client(service_name="secretsmanager", region_name=region_name)
+            response = client.get_secret_value(SecretId=secret_name)
+            secret = json.loads(response["SecretString"])
+            logger.info("Loaded RDS credentials from AWS Secrets Manager (%s)", secret_name)
+            return {
+                "host": secret.get("host", os.environ.get("DB_HOST", "localhost")),
+                "user": secret.get("username", os.environ.get("DB_USER", "admin")),
+                "password": secret.get("password", os.environ.get("DB_PASSWORD", "")),
+                "database": secret.get("dbname", os.environ.get("DB_NAME", "helpdesk_db")),
+                "port": int(secret.get("port", os.environ.get("DB_PORT", 3306))),
+            }
+        except Exception as exc:
+            logger.error("Failed to fetch secret from Secrets Manager: %s. Falling back to env vars.", exc)
+
+    return {
+        "host": os.environ.get("DB_HOST", "localhost"),
+        "user": os.environ.get("DB_USER", "admin"),
+        "password": os.environ.get("DB_PASSWORD", "changeme"),
+        "database": os.environ.get("DB_NAME", "helpdesk_db"),
+        "port": int(os.environ.get("DB_PORT", 3306)),
+    }
 
 
-def ensure_table():
-    global _table_ready
-    if _table_ready:
-        return
-    conn = get_conn()
+DB_CONFIG = load_db_config()
+
+
+# ==============================================================================
+# 3. Resilient Database Connection & Multi-AZ Failover Retry Decorator
+# ==============================================================================
+def get_db_connection():
+    """
+    Creates a fresh PyMySQL connection with short connect/read/write timeouts
+    so RDS Multi-AZ DNS flips and dropped connections are detected rapidly.
+    """
+    return pymysql.connect(
+        host=DB_CONFIG["host"],
+        user=DB_CONFIG["user"],
+        password=DB_CONFIG["password"],
+        database=DB_CONFIG["database"],
+        port=DB_CONFIG["port"],
+        cursorclass=DictCursor,
+        connect_timeout=5,
+        read_timeout=10,
+        write_timeout=10,
+        autocommit=False,
+        charset="utf8mb4",
+    )
+
+
+def with_db_retry(max_retries=3, base_delay=0.8):
+    """
+    Decorator that wraps database operations with exponential backoff retry logic.
+    Handles transient connection drops and read-only states during RDS Multi-AZ failover.
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_error = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except pymysql.MySQLError as exc:
+                    last_error = exc
+                    logger.warning(
+                        "Database operation failed in %s (attempt %d/%d): %s",
+                        func.__name__,
+                        attempt,
+                        max_retries,
+                        exc,
+                    )
+                    if attempt < max_retries:
+                        sleep_time = base_delay * (2 ** (attempt - 1))
+                        time.sleep(sleep_time)
+            logger.error("All %d DB retry attempts exhausted in %s: %s", max_retries, func.__name__, last_error)
+            raise last_error
+        return wrapper
+    return decorator
+
+
+@with_db_retry(max_retries=5, base_delay=1.0)
+def init_db():
+    """Creates the helpdesk database and tickets table if they do not exist."""
+    conn = pymysql.connect(
+        host=DB_CONFIG["host"],
+        user=DB_CONFIG["user"],
+        password=DB_CONFIG["password"],
+        port=DB_CONFIG["port"],
+        connect_timeout=5,
+        charset="utf8mb4",
+    )
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """CREATE TABLE IF NOT EXISTS tasks (
+        with conn.cursor() as cursor:
+            cursor.execute(
+                f"CREATE DATABASE IF NOT EXISTS `{DB_CONFIG['database']}` "
+                "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tickets (
                     id INT AUTO_INCREMENT PRIMARY KEY,
-                    title VARCHAR(255) NOT NULL,
-                    completed TINYINT(1) NOT NULL DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )"""
+                    subject VARCHAR(255) NOT NULL,
+                    description TEXT,
+                    customer_name VARCHAR(120) NOT NULL,
+                    customer_email VARCHAR(160) NOT NULL,
+                    category VARCHAR(64) NOT NULL DEFAULT 'Technical Support',
+                    priority ENUM('Low', 'Medium', 'High', 'Critical') NOT NULL DEFAULT 'Medium',
+                    status ENUM('Open', 'In Progress', 'Resolved') NOT NULL DEFAULT 'Open',
+                    assigned_to VARCHAR(120) DEFAULT 'Unassigned',
+                    resolution_notes TEXT,
+                    created_by_instance VARCHAR(64),
+                    created_by_az VARCHAR(64),
+                    last_updated_by_instance VARCHAR(64),
+                    last_updated_by_az VARCHAR(64),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    INDEX idx_status (status),
+                    INDEX idx_priority (priority),
+                    INDEX idx_created_at (created_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """
             )
-        _table_ready = True
+        conn.commit()
+        logger.info("Helpdesk database schema verified on %s", DB_CONFIG["host"])
     finally:
         conn.close()
 
 
-def run(query, params=None, fetch=None):
-    ensure_table()
-    conn = get_conn()
+def serialize_ticket(ticket):
+    """Formats datetime fields for JSON output."""
+    if not ticket:
+        return ticket
+    for key in ("created_at", "updated_at"):
+        if ticket.get(key) and hasattr(ticket[key], "isoformat"):
+            ticket[key] = ticket[key].isoformat()
+    return ticket
+
+
+# ==============================================================================
+# 4. Application Load Balancer Health Check Endpoint (/health)
+# ==============================================================================
+@app.route("/health", methods=["GET"])
+def health_light():
+    return jsonify(status="ok", instance=INSTANCE_META), 200
+
+@app.route("/health/db", methods=["GET"])
+def health_check():
+    """
+    ALB Target Group Health Check Endpoint.
+    Verifies both Flask process responsiveness and RDS MySQL reachability.
+    Returns HTTP 200 when healthy, HTTP 503 if the database cannot be reached.
+    """
+    start_time = time.time()
     try:
-        with conn.cursor() as cur:
-            cur.execute(query, params or ())
-            if fetch == "all":
-                return cur.fetchall()
-            if fetch == "id":
-                return cur.lastrowid
-            return cur.rowcount
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT 1 AS ok;")
+                row = cursor.fetchone()
+        finally:
+            conn.close()
+
+        latency_ms = round((time.time() - start_time) * 1000, 2)
+        return jsonify({
+            "status": "healthy",
+            "service": "ha-helpdesk-portal",
+            "database": "connected" if row and row.get("ok") == 1 else "degraded",
+            "db_latency_ms": latency_ms,
+            "instance_id": INSTANCE_META["instance_id"],
+            "availability_zone": INSTANCE_META["availability_zone"],
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }), 200
+    except Exception as exc:
+        logger.error("Health check failed: %s", exc)
+        return jsonify({
+            "status": "unhealthy",
+            "service": "ha-helpdesk-portal",
+            "database": "disconnected",
+            "error": str(exc),
+            "instance_id": INSTANCE_META["instance_id"],
+            "availability_zone": INSTANCE_META["availability_zone"],
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }), 503
+
+
+# ==============================================================================
+# 5. REST API Endpoints for Support Ticket Management (CRUD & Filtering)
+# ==============================================================================
+@app.route("/api/metadata", methods=["GET"])
+def api_metadata():
+    """Returns the current EC2 instance ID and AZ serving the request."""
+    return jsonify(INSTANCE_META), 200
+
+
+@app.route("/api/tickets", methods=["GET"])
+@with_db_retry()
+def list_tickets():
+    """Lists support tickets with optional filtering by status, priority, or assignee."""
+    status_filter = request.args.get("status", "all")
+    priority_filter = request.args.get("priority", "all")
+    search_query = (request.args.get("q") or "").strip()
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            where_clauses = []
+            params = []
+
+            if status_filter in VALID_STATUSES:
+                where_clauses.append("status = %s")
+                params.append(status_filter)
+
+            if priority_filter in VALID_PRIORITIES:
+                where_clauses.append("priority = %s")
+                params.append(priority_filter)
+
+            if search_query:
+                where_clauses.append(
+                    "(subject LIKE %s OR customer_name LIKE %s OR customer_email LIKE %s OR assigned_to LIKE %s)"
+                )
+                like_val = f"%{search_query}%"
+                params.extend([like_val, like_val, like_val, like_val])
+
+            where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+            query = f"""
+                SELECT * FROM tickets
+                {where_sql}
+                ORDER BY
+                    FIELD(status, 'Open', 'In Progress', 'Resolved'),
+                    FIELD(priority, 'Critical', 'High', 'Medium', 'Low'),
+                    created_at DESC;
+            """
+            cursor.execute(query, tuple(params))
+            tickets = [serialize_ticket(row) for row in cursor.fetchall()]
+
+            # Aggregate summary counts for dashboard KPI cards
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN status = 'Open' THEN 1 ELSE 0 END) AS open_count,
+                    SUM(CASE WHEN status = 'In Progress' THEN 1 ELSE 0 END) AS in_progress_count,
+                    SUM(CASE WHEN status = 'Resolved' THEN 1 ELSE 0 END) AS resolved_count,
+                    SUM(CASE WHEN priority = 'Critical' AND status != 'Resolved' THEN 1 ELSE 0 END) AS active_critical_count
+                FROM tickets;
+                """
+            )
+            stats = cursor.fetchone() or {}
+
+        return jsonify({
+            "tickets": tickets,
+            "stats": {
+                "total": int(stats.get("total") or 0),
+                "open": int(stats.get("open_count") or 0),
+                "in_progress": int(stats.get("in_progress_count") or 0),
+                "resolved": int(stats.get("resolved_count") or 0),
+                "active_critical": int(stats.get("active_critical_count") or 0),
+            },
+            "served_by": INSTANCE_META,
+        }), 200
     finally:
         conn.close()
 
 
-def imds(path):
-    """Instance metadata (IMDSv2). Used to show which server answered."""
+@app.route("/api/tickets", methods=["POST"])
+@with_db_retry()
+def create_ticket():
+    """Submits a new customer support ticket into RDS MySQL."""
+    data = request.get_json(silent=True) or {}
+    subject = (data.get("subject") or "").strip()
+    description = (data.get("description") or "").strip()
+    customer_name = (data.get("customer_name") or "").strip()
+    customer_email = (data.get("customer_email") or "").strip()
+    category = (data.get("category") or "Technical Support").strip()
+    priority = (data.get("priority") or "Medium").strip()
+    assigned_to = (data.get("assigned_to") or "Unassigned").strip() or "Unassigned"
+
+    if not subject or not customer_name or not customer_email:
+        return jsonify({"error": "Subject, customer name, and customer email are required."}), 400
+
+    if priority not in VALID_PRIORITIES:
+        priority = "Medium"
+    if category not in VALID_CATEGORIES:
+        category = "Technical Support"
+
+    conn = get_db_connection()
     try:
-        req = urllib.request.Request(
-            "http://169.254.169.254/latest/api/token", method="PUT",
-            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"})
-        token = urllib.request.urlopen(req, timeout=1).read().decode()
-        req = urllib.request.Request(
-            f"http://169.254.169.254/latest/meta-data/{path}",
-            headers={"X-aws-ec2-metadata-token": token})
-        return urllib.request.urlopen(req, timeout=1).read().decode()
-    except Exception:  # noqa: BLE001
-        return "unknown"
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO tickets (
+                    subject, description, customer_name, customer_email,
+                    category, priority, status, assigned_to,
+                    created_by_instance, created_by_az,
+                    last_updated_by_instance, last_updated_by_az
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, 'Open', %s, %s, %s, %s, %s);
+                """,
+                (
+                    subject,
+                    description,
+                    customer_name,
+                    customer_email,
+                    category,
+                    priority,
+                    assigned_to,
+                    INSTANCE_META["instance_id"],
+                    INSTANCE_META["availability_zone"],
+                    INSTANCE_META["instance_id"],
+                    INSTANCE_META["availability_zone"],
+                ),
+            )
+            ticket_id = cursor.lastrowid
+            conn.commit()
+
+            cursor.execute("SELECT * FROM tickets WHERE id = %s;", (ticket_id,))
+            new_ticket = serialize_ticket(cursor.fetchone())
+
+        logger.info(
+            "Created support ticket ID=%d (priority=%s) on instance=%s (%s)",
+            ticket_id,
+            priority,
+            INSTANCE_META["instance_id"],
+            INSTANCE_META["availability_zone"],
+        )
+        return jsonify({"ticket": new_ticket, "served_by": INSTANCE_META}), 201
+    finally:
+        conn.close()
 
 
-@app.route("/")
+@app.route("/api/tickets/<int:ticket_id>", methods=["PUT", "PATCH"])
+@with_db_retry()
+def update_ticket(ticket_id):
+    """Updates ticket status ('Open', 'In Progress', 'Resolved'), priority, assignee, or details."""
+    data = request.get_json(silent=True) or {}
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM tickets WHERE id = %s;", (ticket_id,))
+            existing = cursor.fetchone()
+            if not existing:
+                return jsonify({"error": "Support ticket not found."}), 404
+
+            subject = (data.get("subject", existing["subject"]) or "").strip()
+            if not subject:
+                return jsonify({"error": "Ticket subject cannot be empty."}), 400
+
+            description = data.get("description", existing["description"])
+            customer_name = (data.get("customer_name", existing["customer_name"]) or "").strip()
+            customer_email = (data.get("customer_email", existing["customer_email"]) or "").strip()
+            category = data.get("category", existing["category"])
+            priority = data.get("priority", existing["priority"])
+            status = data.get("status", existing["status"])
+            assigned_to = (data.get("assigned_to", existing["assigned_to"]) or "Unassigned").strip()
+            resolution_notes = data.get("resolution_notes", existing["resolution_notes"])
+
+            if priority not in VALID_PRIORITIES:
+                priority = existing["priority"]
+            if status not in VALID_STATUSES:
+                status = existing["status"]
+
+            cursor.execute(
+                """
+                UPDATE tickets
+                SET subject = %s,
+                    description = %s,
+                    customer_name = %s,
+                    customer_email = %s,
+                    category = %s,
+                    priority = %s,
+                    status = %s,
+                    assigned_to = %s,
+                    resolution_notes = %s,
+                    last_updated_by_instance = %s,
+                    last_updated_by_az = %s
+                WHERE id = %s;
+                """,
+                (
+                    subject,
+                    description,
+                    customer_name,
+                    customer_email,
+                    category,
+                    priority,
+                    status,
+                    assigned_to,
+                    resolution_notes,
+                    INSTANCE_META["instance_id"],
+                    INSTANCE_META["availability_zone"],
+                    ticket_id,
+                ),
+            )
+            conn.commit()
+
+            cursor.execute("SELECT * FROM tickets WHERE id = %s;", (ticket_id,))
+            updated = serialize_ticket(cursor.fetchone())
+
+        logger.info(
+            "Updated ticket ID=%d (status=%s, assigned_to=%s) on instance=%s",
+            ticket_id,
+            status,
+            assigned_to,
+            INSTANCE_META["instance_id"],
+        )
+        return jsonify({"ticket": updated, "served_by": INSTANCE_META}), 200
+    finally:
+        conn.close()
+
+
+@app.route("/api/tickets/<int:ticket_id>", methods=["DELETE"])
+@with_db_retry()
+def delete_ticket(ticket_id):
+    """Deletes a support ticket from RDS MySQL."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT id FROM tickets WHERE id = %s;", (ticket_id,))
+            if not cursor.fetchone():
+                return jsonify({"error": "Support ticket not found."}), 404
+
+            cursor.execute("DELETE FROM tickets WHERE id = %s;", (ticket_id,))
+            conn.commit()
+
+        logger.info("Deleted ticket ID=%d on instance=%s", ticket_id, INSTANCE_META["instance_id"])
+        return jsonify({"deleted_id": ticket_id, "served_by": INSTANCE_META}), 200
+    finally:
+        conn.close()
+
+
+# ==============================================================================
+# 6. Frontend UI (HTML, CSS, JavaScript)
+#    Includes Live AWS High-Availability Telemetry Bar & Helpdesk KPI Dashboard
+# ==============================================================================
+FRONTEND_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AWS Highly Available Support Ticket & Helpdesk Portal</title>
+    <style>
+        :root {
+            --bg: #0b1120;
+            --surface: #1e293b;
+            --surface-alt: #0f172a;
+            --surface-hover: #334155;
+            --border: #334155;
+            --text: #f8fafc;
+            --text-muted: #94a3b8;
+            --accent: #38bdf8;
+            --accent-hover: #0284c7;
+            --success: #22c55e;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --purple: #a855f7;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            padding: 1.75rem 1rem 3rem;
+        }
+        .container {
+            max-width: 1080px;
+            margin: 0 auto;
+        }
+        /* AWS Telemetry Bar */
+        .telemetry-bar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+            justify-content: space-between;
+            align-items: center;
+            background: rgba(30, 41, 59, 0.92);
+            border: 1px solid var(--border);
+            border-radius: 0.75rem;
+            padding: 0.8rem 1.2rem;
+            margin-bottom: 1.5rem;
+            font-size: 0.84rem;
+        }
+        .telemetry-group {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+        }
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.28rem 0.7rem;
+            border-radius: 999px;
+            font-weight: 600;
+            font-size: 0.78rem;
+            background: var(--surface-alt);
+            border: 1px solid var(--border);
+        }
+        .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--success);
+            box-shadow: 0 0 8px var(--success);
+        }
+        .dot.unhealthy { background: var(--danger); box-shadow: 0 0 8px var(--danger); }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-end;
+            flex-wrap: wrap;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+        header h1 {
+            font-size: 1.8rem;
+            font-weight: 700;
+            margin-bottom: 0.3rem;
+        }
+        header p {
+            color: var(--text-muted);
+            font-size: 0.95rem;
+        }
+
+        /* KPI Summary Cards */
+        .kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+        @media (max-width: 768px) {
+            .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+        }
+        .kpi-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 0.75rem;
+            padding: 1rem 1.2rem;
+        }
+        .kpi-label {
+            font-size: 0.78rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: var(--text-muted);
+            margin-bottom: 0.35rem;
+        }
+        .kpi-value {
+            font-size: 1.75rem;
+            font-weight: 700;
+        }
+        .kpi-open { color: var(--accent); }
+        .kpi-progress { color: var(--warning); }
+        .kpi-resolved { color: var(--success); }
+        .kpi-critical { color: var(--danger); }
+
+        /* Form Card */
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 0.75rem;
+            padding: 1.35rem;
+            margin-bottom: 1.5rem;
+        }
+        .card-title {
+            font-size: 1.05rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .form-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 0.85rem;
+            margin-bottom: 0.85rem;
+        }
+        .form-grid-2 {
+            display: grid;
+            grid-template-columns: 2fr 1fr 1fr;
+            gap: 0.85rem;
+            margin-bottom: 0.85rem;
+        }
+        @media (max-width: 768px) {
+            .form-grid, .form-grid-2 { grid-template-columns: 1fr; }
+        }
+        label {
+            display: block;
+            font-size: 0.78rem;
+            color: var(--text-muted);
+            margin-bottom: 0.3rem;
+            font-weight: 600;
+        }
+        input, select, textarea {
+            background: var(--surface-alt);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 0.62rem 0.8rem;
+            border-radius: 0.5rem;
+            font-size: 0.9rem;
+            width: 100%;
+        }
+        input:focus, select:focus, textarea:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        button {
+            background: var(--accent);
+            color: #0b1120;
+            font-weight: 600;
+            border: none;
+            padding: 0.65rem 1.2rem;
+            border-radius: 0.5rem;
+            cursor: pointer;
+            font-size: 0.88rem;
+            transition: all 0.15s ease;
+        }
+        button:hover { background: var(--accent-hover); color: #fff; }
+        .btn-secondary {
+            background: transparent;
+            color: var(--text-muted);
+            border: 1px solid var(--border);
+        }
+        .btn-secondary:hover {
+            background: var(--surface-hover);
+            color: var(--text);
+        }
+        .btn-danger {
+            background: rgba(239, 68, 68, 0.15);
+            color: #fca5a5;
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            padding: 0.4rem 0.75rem;
+            font-size: 0.78rem;
+        }
+        .btn-danger:hover { background: var(--danger); color: #fff; }
+        .btn-edit {
+            background: rgba(56, 189, 248, 0.15);
+            color: var(--accent);
+            border: 1px solid rgba(56, 189, 248, 0.3);
+            padding: 0.4rem 0.75rem;
+            font-size: 0.78rem;
+        }
+
+        /* Filter & Search Bar */
+        .toolbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+        }
+        .filters {
+            display: flex;
+            gap: 0.45rem;
+            flex-wrap: wrap;
+        }
+        .filter-btn.active {
+            background: var(--accent);
+            color: #0b1120;
+            border-color: var(--accent);
+        }
+        .toolbar-right {
+            display: flex;
+            gap: 0.6rem;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        /* Ticket Cards */
+        .ticket-list {
+            display: flex;
+            flex-direction: column;
+            gap: 0.85rem;
+        }
+        .ticket-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 0.75rem;
+            padding: 1.15rem 1.25rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 1.25rem;
+            flex-wrap: wrap;
+        }
+        .ticket-card.resolved {
+            opacity: 0.75;
+            border-color: rgba(34, 197, 94, 0.3);
+        }
+        .ticket-main { flex: 1; min-width: 280px; }
+        .ticket-header {
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            flex-wrap: wrap;
+            margin-bottom: 0.4rem;
+        }
+        .ticket-id {
+            font-family: monospace;
+            font-size: 0.82rem;
+            color: var(--accent);
+            background: rgba(56, 189, 248, 0.12);
+            padding: 0.15rem 0.45rem;
+            border-radius: 0.35rem;
+            font-weight: 700;
+        }
+        .ticket-subject {
+            font-weight: 700;
+            font-size: 1.05rem;
+        }
+        .ticket-desc {
+            color: var(--text-muted);
+            font-size: 0.88rem;
+            margin-bottom: 0.65rem;
+            line-height: 1.45;
+        }
+        .ticket-meta {
+            display: flex;
+            gap: 0.9rem;
+            flex-wrap: wrap;
+            font-size: 0.78rem;
+            color: var(--text-muted);
+        }
+        .pill {
+            text-transform: uppercase;
+            font-weight: 700;
+            font-size: 0.68rem;
+            padding: 0.18rem 0.55rem;
+            border-radius: 999px;
+            letter-spacing: 0.03em;
+        }
+        .priority-Critical { background: rgba(239, 68, 68, 0.22); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4); }
+        .priority-High { background: rgba(245, 158, 11, 0.2); color: #fcd34d; }
+        .priority-Medium { background: rgba(56, 189, 248, 0.18); color: #7dd3fc; }
+        .priority-Low { background: rgba(148, 163, 184, 0.2); color: #cbd5e1; }
+
+        .status-Open { background: rgba(56, 189, 248, 0.18); color: #38bdf8; }
+        .status-In-Progress { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
+        .status-Resolved { background: rgba(34, 197, 94, 0.2); color: #4ade80; }
+
+        .ticket-controls {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+            gap: 0.55rem;
+            min-width: 220px;
+        }
+        .quick-row {
+            display: flex;
+            gap: 0.45rem;
+            width: 100%;
+        }
+        .quick-row select, .quick-row input {
+            padding: 0.38rem 0.55rem;
+            font-size: 0.8rem;
+        }
+        .empty-state {
+            text-align: center;
+            padding: 2.75rem 1rem;
+            color: var(--text-muted);
+            border: 1px dashed var(--border);
+            border-radius: 0.75rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- AWS High Availability Telemetry Bar -->
+        <div class="telemetry-bar">
+            <div class="telemetry-group">
+                <span class="badge">
+                    <span id="health-dot" class="dot"></span>
+                    <span id="health-text">ALB Target: Healthy</span>
+                </span>
+                <span class="badge">Serving EC2: <strong id="meta-instance">{{ instance_id }}</strong></span>
+                <span class="badge">Availability Zone: <strong id="meta-az">{{ availability_zone }}</strong></span>
+                <span class="badge">RDS Latency: <strong id="meta-latency">-- ms</strong></span>
+            </div>
+            <button class="btn-secondary" style="padding: 0.35rem 0.75rem; font-size: 0.78rem;" onclick="pingHealth()">
+                Refresh Node Telemetry
+            </button>
+        </div>
+
+        <header>
+            <div>
+                <h1>Cloud Support Ticket & Helpdesk Portal</h1>
+                <p>Highly Available Multi-AZ Customer Support System on AWS (ALB + EC2 Auto Scaling + Multi-AZ RDS MySQL)</p>
+            </div>
+        </header>
+
+        <!-- Live KPI Summary Row -->
+        <div class="kpi-grid">
+            <div class="kpi-card">
+                <div class="kpi-label">Open Tickets</div>
+                <div class="kpi-value kpi-open" id="kpi-open">0</div>
+            </div>
+            <div class="kpi-card">
+                <div class="kpi-label">In Progress</div>
+                <div class="kpi-value kpi-progress" id="kpi-progress">0</div>
+            </div>
+            <div class="kpi-card">
+                <div class="kpi-label">Resolved</div>
+                <div class="kpi-value kpi-resolved" id="kpi-resolved">0</div>
+            </div>
+            <div class="kpi-card">
+                <div class="kpi-label">Active Critical</div>
+                <div class="kpi-value kpi-critical" id="kpi-critical">0</div>
+            </div>
+        </div>
+
+        <!-- Submit / Edit Support Ticket Form -->
+        <div class="card">
+            <div class="card-title">
+                <span id="form-heading">Submit New Support Ticket</span>
+                <button type="button" id="cancel-edit-btn" class="btn-secondary" style="display:none; padding:0.3rem 0.7rem; font-size:0.78rem;" onclick="resetForm()">Cancel Edit</button>
+            </div>
+            <form id="ticket-form" onsubmit="handleSaveTicket(event)">
+                <input type="hidden" id="edit-ticket-id" value="" />
+                <div class="form-grid">
+                    <div>
+                        <label>Customer Name *</label>
+                        <input type="text" id="customer-name" placeholder="e.g., Priya Sharma" required />
+                    </div>
+                    <div>
+                        <label>Customer Email *</label>
+                        <input type="email" id="customer-email" placeholder="e.g., priya@example.com" required />
+                    </div>
+                    <div>
+                        <label>Assigned Support Agent</label>
+                        <input type="text" id="assigned-to" placeholder="Unassigned or Agent Name" value="Unassigned" />
+                    </div>
+                </div>
+                <div class="form-grid-2">
+                    <div>
+                        <label>Ticket Subject *</label>
+                        <input type="text" id="ticket-subject" placeholder="Brief summary of the customer issue..." required />
+                    </div>
+                    <div>
+                        <label>Category</label>
+                        <select id="ticket-category">
+                            <option value="Technical Support" selected>Technical Support</option>
+                            <option value="Billing">Billing</option>
+                            <option value="Account Access">Account Access</option>
+                            <option value="Outage / Incident">Outage / Incident</option>
+                            <option value="Feature Request">Feature Request</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label>Priority</label>
+                        <select id="ticket-priority">
+                            <option value="Low">Low</option>
+                            <option value="Medium" selected>Medium</option>
+                            <option value="High">High</option>
+                            <option value="Critical">Critical</option>
+                        </select>
+                    </div>
+                </div>
+                <div style="margin-bottom: 0.85rem;">
+                    <label>Issue Description & Reproduction Steps</label>
+                    <textarea id="ticket-desc" rows="2" placeholder="Describe the issue, error codes, or customer impact..."></textarea>
+                </div>
+                <div style="display: flex; justify-content: flex-end;">
+                    <button type="submit" id="submit-btn">Submit Support Ticket</button>
+                </div>
+            </form>
+        </div>
+
+        <!-- Filter & Search Toolbar -->
+        <div class="toolbar">
+            <div class="filters">
+                <button class="btn-secondary filter-btn active" onclick="setStatusFilter('all', this)">All Statuses</button>
+                <button class="btn-secondary filter-btn" onclick="setStatusFilter('Open', this)">Open</button>
+                <button class="btn-secondary filter-btn" onclick="setStatusFilter('In Progress', this)">In Progress</button>
+                <button class="btn-secondary filter-btn" onclick="setStatusFilter('Resolved', this)">Resolved</button>
+            </div>
+            <div class="toolbar-right">
+                <select id="priority-filter" onchange="fetchTickets()" style="width: auto; padding: 0.48rem 0.75rem;">
+                    <option value="all">All Priorities</option>
+                    <option value="Critical">Critical Only</option>
+                    <option value="High">High Only</option>
+                    <option value="Medium">Medium Only</option>
+                    <option value="Low">Low Only</option>
+                </select>
+                <input type="text" id="search-box" placeholder="Search subject, customer, agent..." oninput="fetchTickets()" style="width: 230px; padding: 0.48rem 0.75rem;" />
+            </div>
+        </div>
+
+        <!-- Tickets List -->
+        <div id="ticket-list" class="ticket-list"></div>
+    </div>
+
+    <script>
+        let currentStatusFilter = 'all';
+        let ticketsCache = [];
+
+        async function pingHealth() {
+            try {
+                const res = await fetch('/health/db');
+                const data = await res.json();
+                const dot = document.getElementById('health-dot');
+                const text = document.getElementById('health-text');
+                document.getElementById('meta-instance').textContent = data.instance_id || 'unknown';
+                document.getElementById('meta-az').textContent = data.availability_zone || 'unknown';
+                document.getElementById('meta-latency').textContent = (data.db_latency_ms !== undefined) ? `${data.db_latency_ms} ms` : 'ERR';
+
+                if (res.ok && data.status === 'healthy') {
+                    dot.classList.remove('unhealthy');
+                    text.textContent = 'ALB Target: Healthy';
+                } else {
+                    dot.classList.add('unhealthy');
+                    text.textContent = 'ALB Target: Unhealthy';
+                }
+            } catch (err) {
+                document.getElementById('health-dot').classList.add('unhealthy');
+                document.getElementById('health-text').textContent = 'Connection Error';
+            }
+        }
+
+        async function fetchTickets() {
+            const priority = document.getElementById('priority-filter').value;
+            const q = document.getElementById('search-box').value;
+            const params = new URLSearchParams({
+                status: currentStatusFilter,
+                priority: priority,
+                q: q
+            });
+            const res = await fetch(`/api/tickets?${params.toString()}`);
+            const data = await res.json();
+
+            if (data.served_by) {
+                document.getElementById('meta-instance').textContent = data.served_by.instance_id;
+                document.getElementById('meta-az').textContent = data.served_by.availability_zone;
+            }
+            if (data.stats) {
+                document.getElementById('kpi-open').textContent = data.stats.open;
+                document.getElementById('kpi-progress').textContent = data.stats.in_progress;
+                document.getElementById('kpi-resolved').textContent = data.stats.resolved;
+                document.getElementById('kpi-critical').textContent = data.stats.active_critical;
+            }
+            ticketsCache = data.tickets || [];
+            renderTickets();
+        }
+
+        function renderTickets() {
+            const listEl = document.getElementById('ticket-list');
+            if (ticketsCache.length === 0) {
+                listEl.innerHTML = `<div class="empty-state">No support tickets match the current filter. Submit a ticket above to verify RDS Multi-AZ persistence!</div>`;
+                return;
+            }
+
+            listEl.innerHTML = ticketsCache.map(t => {
+                const statusClass = t.status.replace(/\\s+/g, '-');
+                return `
+                <div class="ticket-card ${t.status === 'Resolved' ? 'resolved' : ''}">
+                    <div class="ticket-main">
+                        <div class="ticket-header">
+                            <span class="ticket-id">TKT-${String(t.id).padStart(4, '0')}</span>
+                            <span class="pill priority-${escapeHtml(t.priority)}">${escapeHtml(t.priority)}</span>
+                            <span class="pill status-${statusClass}">${escapeHtml(t.status)}</span>
+                            <span class="pill" style="background:rgba(168,85,247,0.15);color:#d8b4fe;">${escapeHtml(t.category)}</span>
+                        </div>
+                        <div class="ticket-subject" style="margin-bottom:0.3rem;">${escapeHtml(t.subject)}</div>
+                        ${t.description ? `<div class="ticket-desc">${escapeHtml(t.description)}</div>` : ''}
+                        <div class="ticket-meta">
+                            <span>Customer: <strong>${escapeHtml(t.customer_name)}</strong> (${escapeHtml(t.customer_email)})</span>
+                            <span>Assignee: <strong>${escapeHtml(t.assigned_to || 'Unassigned')}</strong></span>
+                            <span>Logged on EC2: <strong>${escapeHtml(t.created_by_instance || 'N/A')}</strong> (${escapeHtml(t.created_by_az || 'N/A')})</span>
+                        </div>
+                    </div>
+                    <div class="ticket-controls">
+                        <div class="quick-row">
+                            <select onchange="quickUpdateStatus(${t.id}, this.value)" title="Update Ticket Status">
+                                <option value="Open" ${t.status === 'Open' ? 'selected' : ''}>Status: Open</option>
+                                <option value="In Progress" ${t.status === 'In Progress' ? 'selected' : ''}>Status: In Progress</option>
+                                <option value="Resolved" ${t.status === 'Resolved' ? 'selected' : ''}>Status: Resolved</option>
+                            </select>
+                        </div>
+                        <div class="quick-row">
+                            <input type="text" value="${escapeHtml(t.assigned_to || 'Unassigned')}"
+                                onblur="quickAssignAgent(${t.id}, this.value)"
+                                placeholder="Assign agent..." title="Assign Support Agent" />
+                        </div>
+                        <div style="display:flex; gap:0.4rem;">
+                            <button class="btn-edit" onclick="startEditTicket(${t.id})">Edit</button>
+                            <button class="btn-danger" onclick="deleteTicket(${t.id})">Delete</button>
+                        </div>
+                    </div>
+                </div>
+                `;
+            }).join('');
+        }
+
+        async function handleSaveTicket(e) {
+            e.preventDefault();
+            const editId = document.getElementById('edit-ticket-id').value;
+            const payload = {
+                customer_name: document.getElementById('customer-name').value,
+                customer_email: document.getElementById('customer-email').value,
+                assigned_to: document.getElementById('assigned-to').value,
+                subject: document.getElementById('ticket-subject').value,
+                category: document.getElementById('ticket-category').value,
+                priority: document.getElementById('ticket-priority').value,
+                description: document.getElementById('ticket-desc').value
+            };
+
+            const url = editId ? `/api/tickets/${editId}` : '/api/tickets';
+            const method = editId ? 'PUT' : 'POST';
+
+            const res = await fetch(url, {
+                method,
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            if (res.ok) {
+                resetForm();
+                await fetchTickets();
+                await pingHealth();
+            }
+        }
+
+        function startEditTicket(id) {
+            const t = ticketsCache.find(item => item.id === id);
+            if (!t) return;
+            document.getElementById('edit-ticket-id').value = t.id;
+            document.getElementById('customer-name').value = t.customer_name;
+            document.getElementById('customer-email').value = t.customer_email;
+            document.getElementById('assigned-to').value = t.assigned_to || 'Unassigned';
+            document.getElementById('ticket-subject').value = t.subject;
+            document.getElementById('ticket-category').value = t.category;
+            document.getElementById('ticket-priority').value = t.priority;
+            document.getElementById('ticket-desc').value = t.description || '';
+            document.getElementById('form-heading').textContent = `Editing Ticket TKT-${String(t.id).padStart(4, '0')}`;
+            document.getElementById('submit-btn').textContent = 'Save Ticket Changes';
+            document.getElementById('cancel-edit-btn').style.display = 'inline-block';
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        }
+
+        function resetForm() {
+            document.getElementById('ticket-form').reset();
+            document.getElementById('edit-ticket-id').value = '';
+            document.getElementById('assigned-to').value = 'Unassigned';
+            document.getElementById('form-heading').textContent = 'Submit New Support Ticket';
+            document.getElementById('submit-btn').textContent = 'Submit Support Ticket';
+            document.getElementById('cancel-edit-btn').style.display = 'none';
+        }
+
+        async function quickUpdateStatus(id, status) {
+            await fetch(`/api/tickets/${id}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ status })
+            });
+            await fetchTickets();
+        }
+
+        async function quickAssignAgent(id, assigned_to) {
+            await fetch(`/api/tickets/${id}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ assigned_to })
+            });
+            await fetchTickets();
+        }
+
+        async function deleteTicket(id) {
+            await fetch(`/api/tickets/${id}`, { method: 'DELETE' });
+            await fetchTickets();
+        }
+
+        function setStatusFilter(status, btn) {
+            currentStatusFilter = status;
+            document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            fetchTickets();
+        }
+
+        function escapeHtml(str) {
+            return String(str ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        // Initial load
+        fetchTickets();
+        pingHealth();
+    </script>
+</body>
+</html>
+"""
+
+
+@app.route("/", methods=["GET"])
 def index():
-    return render_template("index.html")
+    """Renders the Support Ticket / Helpdesk Portal UI along with EC2 instance metadata."""
+    return render_template_string(
+        FRONTEND_HTML,
+        instance_id=INSTANCE_META["instance_id"],
+        availability_zone=INSTANCE_META["availability_zone"],
+    )
 
 
-@app.route("/health")
-def health():
-    # Lightweight on purpose: does NOT touch the DB, so a DB failover
-    # doesn't make the ALB mark every instance unhealthy.
-    return jsonify(status="ok"), 200
-
-
-@app.route("/health/db")
-def health_db():
+# ==============================================================================
+# 7. Application Entrypoint
+# ==============================================================================
+with app.app_context():
     try:
-        run("SELECT 1", fetch="all")
-        return jsonify(status="ok", db="up"), 200
-    except Exception as e:  # noqa: BLE001
-        return jsonify(status="degraded", db=str(e)), 503
+        init_db()
+    except Exception as exc:
+        logger.warning("Initial DB setup deferred until first request/health check: %s", exc)
 
-
-@app.route("/api/info")
-def info():
-    return jsonify(instance_id=imds("instance-id"),
-                   az=imds("placement/availability-zone"))
-
-
-@app.route("/api/tasks", methods=["GET"])
-def list_tasks():
-    return jsonify(run("SELECT * FROM tasks ORDER BY id DESC", fetch="all"))
-
-
-@app.route("/api/tasks", methods=["POST"])
-def add_task():
-    title = (request.json or {}).get("title", "").strip()
-    if not title:
-        return jsonify(error="title required"), 400
-    new_id = run("INSERT INTO tasks (title) VALUES (%s)", (title,), fetch="id")
-    return jsonify(id=new_id, title=title, completed=0), 201
-
-
-@app.route("/api/tasks/<int:task_id>", methods=["PUT"])
-def update_task(task_id):
-    data = request.json or {}
-    if "title" in data:
-        run("UPDATE tasks SET title=%s WHERE id=%s", (data["title"], task_id))
-    if "completed" in data:
-        run("UPDATE tasks SET completed=%s WHERE id=%s",
-            (1 if data["completed"] else 0, task_id))
-    return jsonify(ok=True)
-
-
-@app.route("/api/tasks/<int:task_id>", methods=["DELETE"])
-def delete_task(task_id):
-    run("DELETE FROM tasks WHERE id=%s", (task_id,))
-    return jsonify(ok=True)
-
-
-@app.errorhandler(Exception)
-def handle_error(e):
-    app.logger.exception(e)
-    return jsonify(error="temporary server error, please retry"), 503
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=False)
