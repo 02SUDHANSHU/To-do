@@ -2,8 +2,8 @@
 Highly Available Support Ticket & Helpdesk Portal on AWS
 Backend: Python Flask + PyMySQL + Boto3 (AWS Secrets Manager)
 Features:
-- Full CRUD Support Ticket API (/api/tickets) with status ('Open', 'In Progress', 'Resolved'),
-  priority ('Low', 'Medium', 'High', 'Critical'), customer info, category, and agent assignment
+- Role-based Support Ticket API (/api/tickets): customers submit/edit their own tickets, support updates status
+  and deletes; two login profiles (customer, support) with signed session cookies
 - Live Ticket Summary Metrics (Open, In Progress, Resolved, Critical counts)
 - Deep ALB Health Check Endpoint (/health) with RDS MySQL connectivity & latency check
 - Automatic Database Reconnection & Exponential Backoff Retry for RDS Multi-AZ Failover
@@ -15,6 +15,7 @@ Features:
 import os
 import time
 import json
+import hashlib
 import logging
 import socket
 from functools import wraps
@@ -24,7 +25,8 @@ from urllib.error import URLError
 
 import pymysql
 from pymysql.cursors import DictCursor
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, session, redirect
+from werkzeug.security import generate_password_hash, check_password_hash
 
 # Optional AWS Secrets Manager support via boto3
 try:
@@ -134,6 +136,25 @@ def load_db_config():
 
 DB_CONFIG = load_db_config()
 
+# Session cookies are signed, so every EC2 instance must use the SAME key or a login
+# on instance A would be rejected by instance B. Set SECRET_KEY in the env file, or the
+# key is derived from the shared RDS password (identical on all instances).
+app.secret_key = os.environ.get("SECRET_KEY") or hashlib.sha256(
+    ("helpdesk-session|" + str(DB_CONFIG["password"])).encode("utf-8")
+).hexdigest()
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "0") == "1",  # set to 1 once HTTPS is on
+    PERMANENT_SESSION_LIFETIME=8 * 3600,
+)
+
+# Two login profiles: (username, role, display name, email, password env var, demo default)
+DEMO_USERS = (
+    ("customer", "customer", "Customer Demo", "customer@example.com", "CUSTOMER_PASSWORD", "Customer@123"),
+    ("support", "support", "Support Agent", "support@example.com", "SUPPORT_PASSWORD", "Support@123"),
+)
+
 
 # ==============================================================================
 # 3. Resilient Database Connection & Multi-AZ Failover Retry Decorator
@@ -237,6 +258,36 @@ def init_db():
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
                 """
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    username VARCHAR(64) NOT NULL UNIQUE,
+                    password_hash VARCHAR(255) NOT NULL,
+                    role ENUM('customer', 'support') NOT NULL,
+                    display_name VARCHAR(120) NOT NULL,
+                    email VARCHAR(160) NOT NULL
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """
+            )
+            for username, role, display, email, env_name, default_pw in DEMO_USERS:
+                env_pw = os.environ.get(env_name)
+                pw_hash = generate_password_hash(env_pw or default_pw)
+                if env_pw:
+                    # Password supplied via env: always keep the DB in sync with it.
+                    cursor.execute(
+                        "INSERT INTO users (username, password_hash, role, display_name, email) "
+                        "VALUES (%s, %s, %s, %s, %s) "
+                        "ON DUPLICATE KEY UPDATE password_hash = VALUES(password_hash), "
+                        "role = VALUES(role), display_name = VALUES(display_name), email = VALUES(email);",
+                        (username, pw_hash, role, display, email),
+                    )
+                else:
+                    cursor.execute(
+                        "INSERT IGNORE INTO users (username, password_hash, role, display_name, email) "
+                        "VALUES (%s, %s, %s, %s, %s);",
+                        (username, pw_hash, role, display, email),
+                    )
         conn.commit()
         logger.info("Helpdesk database schema verified on %s", DB_CONFIG["host"])
     finally:
@@ -256,9 +307,78 @@ def serialize_ticket(ticket):
 # ==============================================================================
 # 4. Application Load Balancer Health Check Endpoint (/health)
 # ==============================================================================
+_schema_ready = False
+_schema_last_try = 0.0
+
+
+def ensure_schema():
+    """Creates tables/users once. Retried (at most every 10s) if RDS was unreachable at boot."""
+    global _schema_ready, _schema_last_try
+    if _schema_ready:
+        return True
+    if time.time() - _schema_last_try < 10:
+        return False
+    _schema_last_try = time.time()
+    try:
+        init_db()
+        _schema_ready = True
+    except Exception as exc:
+        logger.warning("Schema setup failed, will retry: %s", exc)
+    return _schema_ready
+
+
+@app.before_request
+def _lazy_schema():
+    if request.path.startswith("/health"):
+        return None
+    ensure_schema()
+    return None
+
+
+def current_user():
+    """Returns the logged-in user from the signed session cookie, or None."""
+    if not session.get("uid"):
+        return None
+    return {
+        "username": session.get("username"),
+        "role": session.get("role"),
+        "display_name": session.get("display_name"),
+        "email": session.get("email"),
+    }
+
+
+def api_auth(*roles):
+    """Requires a logged-in user, optionally restricted to the given roles."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            user = current_user()
+            if not user:
+                return jsonify({"error": "Authentication required."}), 401
+            if roles and user["role"] not in roles:
+                return jsonify({"error": "You do not have permission for this action."}), 403
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+@with_db_retry()
+def fetch_user(username):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM users WHERE username = %s;", (username,))
+            return cursor.fetchone()
+    finally:
+        conn.close()
+
+
 @app.route("/health", methods=["GET"])
 def health_light():
-    return jsonify(status="ok", instance=INSTANCE_META), 200
+    """ALB health check. Deliberately does NOT touch the DB, so an RDS failover
+    cannot mark every instance unhealthy at once."""
+    return jsonify({"status": "ok", "instance_id": INSTANCE_META["instance_id"]}), 200
+
 
 @app.route("/health/db", methods=["GET"])
 def health_check():
@@ -310,9 +430,10 @@ def api_metadata():
 
 
 @app.route("/api/tickets", methods=["GET"])
+@api_auth("customer", "support")
 @with_db_retry()
 def list_tickets():
-    """Lists support tickets with optional filtering by status, priority, or assignee."""
+    """Lists tickets (customers: own only; support: all) with optional status/priority/search filters."""
     status_filter = request.args.get("status", "all")
     priority_filter = request.args.get("priority", "all")
     search_query = (request.args.get("q") or "").strip()
@@ -322,6 +443,12 @@ def list_tickets():
         with conn.cursor() as cursor:
             where_clauses = []
             params = []
+            user = current_user()
+
+            # Customers only ever see their own tickets; support sees everything.
+            if user["role"] == "customer":
+                where_clauses.append("customer_email = %s")
+                params.append(user["email"])
 
             if status_filter in VALID_STATUSES:
                 where_clauses.append("status = %s")
@@ -333,10 +460,10 @@ def list_tickets():
 
             if search_query:
                 where_clauses.append(
-                    "(subject LIKE %s OR customer_name LIKE %s OR customer_email LIKE %s OR assigned_to LIKE %s)"
+                    "(subject LIKE %s OR customer_name LIKE %s OR customer_email LIKE %s)"
                 )
                 like_val = f"%{search_query}%"
-                params.extend([like_val, like_val, like_val, like_val])
+                params.extend([like_val, like_val, like_val])
 
             where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
             query = f"""
@@ -359,8 +486,10 @@ def list_tickets():
                     SUM(CASE WHEN status = 'In Progress' THEN 1 ELSE 0 END) AS in_progress_count,
                     SUM(CASE WHEN status = 'Resolved' THEN 1 ELSE 0 END) AS resolved_count,
                     SUM(CASE WHEN priority = 'Critical' AND status != 'Resolved' THEN 1 ELSE 0 END) AS active_critical_count
-                FROM tickets;
-                """
+                FROM tickets
+                WHERE (%s = 'support' OR customer_email = %s);
+                """,
+                (user["role"], user["email"]),
             )
             stats = cursor.fetchone() or {}
 
@@ -380,20 +509,22 @@ def list_tickets():
 
 
 @app.route("/api/tickets", methods=["POST"])
+@api_auth("customer")
 @with_db_retry()
 def create_ticket():
     """Submits a new customer support ticket into RDS MySQL."""
     data = request.get_json(silent=True) or {}
     subject = (data.get("subject") or "").strip()
     description = (data.get("description") or "").strip()
-    customer_name = (data.get("customer_name") or "").strip()
-    customer_email = (data.get("customer_email") or "").strip()
+    user = current_user()
+    customer_name = user["display_name"]
+    customer_email = user["email"]
     category = (data.get("category") or "Technical Support").strip()
     priority = (data.get("priority") or "Medium").strip()
-    assigned_to = (data.get("assigned_to") or "Unassigned").strip() or "Unassigned"
 
-    if not subject or not customer_name or not customer_email:
-        return jsonify({"error": "Subject, customer name, and customer email are required."}), 400
+    if not subject:
+        return jsonify({"error": "Ticket subject is required."}), 400
+    subject = subject[:255]
 
     if priority not in VALID_PRIORITIES:
         priority = "Medium"
@@ -407,11 +538,11 @@ def create_ticket():
                 """
                 INSERT INTO tickets (
                     subject, description, customer_name, customer_email,
-                    category, priority, status, assigned_to,
+                    category, priority, status,
                     created_by_instance, created_by_az,
                     last_updated_by_instance, last_updated_by_az
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, 'Open', %s, %s, %s, %s, %s);
+                VALUES (%s, %s, %s, %s, %s, %s, 'Open', %s, %s, %s, %s);
                 """,
                 (
                     subject,
@@ -420,7 +551,6 @@ def create_ticket():
                     customer_email,
                     category,
                     priority,
-                    assigned_to,
                     INSTANCE_META["instance_id"],
                     INSTANCE_META["availability_zone"],
                     INSTANCE_META["instance_id"],
@@ -446,9 +576,11 @@ def create_ticket():
 
 
 @app.route("/api/tickets/<int:ticket_id>", methods=["PUT", "PATCH"])
+@api_auth("customer", "support")
 @with_db_retry()
 def update_ticket(ticket_id):
-    """Updates ticket status ('Open', 'In Progress', 'Resolved'), priority, assignee, or details."""
+    """Support changes ticket status; customers edit their OWN tickets while still Open."""
+    user = current_user()
     data = request.get_json(silent=True) or {}
     conn = get_db_connection()
     try:
@@ -458,73 +590,60 @@ def update_ticket(ticket_id):
             if not existing:
                 return jsonify({"error": "Support ticket not found."}), 404
 
-            subject = (data.get("subject", existing["subject"]) or "").strip()
-            if not subject:
-                return jsonify({"error": "Ticket subject cannot be empty."}), 400
+            if user["role"] == "support":
+                status = data.get("status", existing["status"])
+                if status not in VALID_STATUSES:
+                    return jsonify({"error": "Invalid status."}), 400
+                cursor.execute(
+                    """
+                    UPDATE tickets
+                    SET status = %s, last_updated_by_instance = %s, last_updated_by_az = %s
+                    WHERE id = %s;
+                    """,
+                    (status, INSTANCE_META["instance_id"], INSTANCE_META["availability_zone"], ticket_id),
+                )
+            else:
+                if existing["customer_email"] != user["email"]:
+                    return jsonify({"error": "Support ticket not found."}), 404
+                if existing["status"] != "Open":
+                    return jsonify({"error": "Only open tickets can be edited."}), 403
 
-            description = data.get("description", existing["description"])
-            customer_name = (data.get("customer_name", existing["customer_name"]) or "").strip()
-            customer_email = (data.get("customer_email", existing["customer_email"]) or "").strip()
-            category = data.get("category", existing["category"])
-            priority = data.get("priority", existing["priority"])
-            status = data.get("status", existing["status"])
-            assigned_to = (data.get("assigned_to", existing["assigned_to"]) or "Unassigned").strip()
-            resolution_notes = data.get("resolution_notes", existing["resolution_notes"])
-
-            if priority not in VALID_PRIORITIES:
-                priority = existing["priority"]
-            if status not in VALID_STATUSES:
-                status = existing["status"]
-
-            cursor.execute(
-                """
-                UPDATE tickets
-                SET subject = %s,
-                    description = %s,
-                    customer_name = %s,
-                    customer_email = %s,
-                    category = %s,
-                    priority = %s,
-                    status = %s,
-                    assigned_to = %s,
-                    resolution_notes = %s,
-                    last_updated_by_instance = %s,
-                    last_updated_by_az = %s
-                WHERE id = %s;
-                """,
-                (
-                    subject,
-                    description,
-                    customer_name,
-                    customer_email,
-                    category,
-                    priority,
-                    status,
-                    assigned_to,
-                    resolution_notes,
-                    INSTANCE_META["instance_id"],
-                    INSTANCE_META["availability_zone"],
-                    ticket_id,
-                ),
-            )
+                subject = (data.get("subject", existing["subject"]) or "").strip()
+                if not subject:
+                    return jsonify({"error": "Ticket subject cannot be empty."}), 400
+                description = data.get("description", existing["description"])
+                category = data.get("category", existing["category"])
+                priority = data.get("priority", existing["priority"])
+                if category not in VALID_CATEGORIES:
+                    category = existing["category"]
+                if priority not in VALID_PRIORITIES:
+                    priority = existing["priority"]
+                cursor.execute(
+                    """
+                    UPDATE tickets
+                    SET subject = %s, description = %s, category = %s, priority = %s,
+                        last_updated_by_instance = %s, last_updated_by_az = %s
+                    WHERE id = %s;
+                    """,
+                    (
+                        subject[:255], description, category, priority,
+                        INSTANCE_META["instance_id"], INSTANCE_META["availability_zone"], ticket_id,
+                    ),
+                )
             conn.commit()
 
             cursor.execute("SELECT * FROM tickets WHERE id = %s;", (ticket_id,))
             updated = serialize_ticket(cursor.fetchone())
 
-        logger.info(
-            "Updated ticket ID=%d (status=%s, assigned_to=%s) on instance=%s",
-            ticket_id,
-            status,
-            assigned_to,
-            INSTANCE_META["instance_id"],
-        )
+        logger.info("Ticket ID=%d updated by %s (%s) on instance=%s",
+                    ticket_id, user["username"], user["role"], INSTANCE_META["instance_id"])
         return jsonify({"ticket": updated, "served_by": INSTANCE_META}), 200
     finally:
         conn.close()
 
 
 @app.route("/api/tickets/<int:ticket_id>", methods=["DELETE"])
+@api_auth("support")
 @with_db_retry()
 def delete_ticket(ticket_id):
     """Deletes a support ticket from RDS MySQL."""
@@ -907,6 +1026,10 @@ FRONTEND_HTML = """
                 <h1>Cloud Support Ticket & Helpdesk Portal</h1>
                 <p>Highly Available Multi-AZ Customer Support System on AWS (ALB + EC2 Auto Scaling + Multi-AZ RDS MySQL)</p>
             </div>
+            <div style="display:flex; align-items:center; gap:0.6rem;">
+                <span class="badge">{{ display_name }} - <strong>{{ role|capitalize }}</strong></span>
+                <a href="/logout" class="badge" style="text-decoration:none; color:inherit;">Log out</a>
+            </div>
         </header>
 
         <!-- Live KPI Summary Row -->
@@ -929,6 +1052,7 @@ FRONTEND_HTML = """
             </div>
         </div>
 
+        {% if role == 'customer' %}
         <!-- Submit / Edit Support Ticket Form -->
         <div class="card">
             <div class="card-title">
@@ -937,20 +1061,7 @@ FRONTEND_HTML = """
             </div>
             <form id="ticket-form" onsubmit="handleSaveTicket(event)">
                 <input type="hidden" id="edit-ticket-id" value="" />
-                <div class="form-grid">
-                    <div>
-                        <label>Customer Name *</label>
-                        <input type="text" id="customer-name" placeholder="e.g., Priya Sharma" required />
-                    </div>
-                    <div>
-                        <label>Customer Email *</label>
-                        <input type="email" id="customer-email" placeholder="e.g., priya@example.com" required />
-                    </div>
-                    <div>
-                        <label>Assigned Support Agent</label>
-                        <input type="text" id="assigned-to" placeholder="Unassigned or Agent Name" value="Unassigned" />
-                    </div>
-                </div>
+                <p style="margin:0 0 0.85rem; font-size:0.85rem; opacity:0.8;">Submitting as <strong>{{ display_name }}</strong></p>
                 <div class="form-grid-2">
                     <div>
                         <label>Ticket Subject *</label>
@@ -986,6 +1097,8 @@ FRONTEND_HTML = """
             </form>
         </div>
 
+        {% endif %}
+
         <!-- Filter & Search Toolbar -->
         <div class="toolbar">
             <div class="filters">
@@ -1002,7 +1115,7 @@ FRONTEND_HTML = """
                     <option value="Medium">Medium Only</option>
                     <option value="Low">Low Only</option>
                 </select>
-                <input type="text" id="search-box" placeholder="Search subject, customer, agent..." oninput="fetchTickets()" style="width: 230px; padding: 0.48rem 0.75rem;" />
+                <input type="text" id="search-box" placeholder="Search subject or customer..." oninput="fetchTickets()" style="width: 230px; padding: 0.48rem 0.75rem;" />
             </div>
         </div>
 
@@ -1013,6 +1126,7 @@ FRONTEND_HTML = """
     <script>
         let currentStatusFilter = 'all';
         let ticketsCache = [];
+        const ROLE = {{ role|tojson }};
 
         async function pingHealth() {
             try {
@@ -1046,6 +1160,7 @@ FRONTEND_HTML = """
                 q: q
             });
             const res = await fetch(`/api/tickets?${params.toString()}`);
+            if (res.status === 401) { window.location = '/login'; return; }
             const data = await res.json();
 
             if (data.served_by) {
@@ -1060,6 +1175,26 @@ FRONTEND_HTML = """
             }
             ticketsCache = data.tickets || [];
             renderTickets();
+        }
+
+        function controlsHtml(t) {
+            if (ROLE === 'support') {
+                return `
+                    <div class="quick-row">
+                        <select onchange="quickUpdateStatus(${t.id}, this.value)" title="Update Ticket Status">
+                            <option value="Open" ${t.status === 'Open' ? 'selected' : ''}>Status: Open</option>
+                            <option value="In Progress" ${t.status === 'In Progress' ? 'selected' : ''}>Status: In Progress</option>
+                            <option value="Resolved" ${t.status === 'Resolved' ? 'selected' : ''}>Status: Resolved</option>
+                        </select>
+                    </div>
+                    <div style="display:flex; gap:0.4rem;">
+                        <button class="btn-danger" onclick="deleteTicket(${t.id})">Delete</button>
+                    </div>`;
+            }
+            if (t.status === 'Open') {
+                return `<div style="display:flex; gap:0.4rem;"><button class="btn-edit" onclick="startEditTicket(${t.id})">Edit</button></div>`;
+            }
+            return `<div class="ticket-desc">Locked once support picks it up</div>`;
         }
 
         function renderTickets() {
@@ -1084,27 +1219,11 @@ FRONTEND_HTML = """
                         ${t.description ? `<div class="ticket-desc">${escapeHtml(t.description)}</div>` : ''}
                         <div class="ticket-meta">
                             <span>Customer: <strong>${escapeHtml(t.customer_name)}</strong> (${escapeHtml(t.customer_email)})</span>
-                            <span>Assignee: <strong>${escapeHtml(t.assigned_to || 'Unassigned')}</strong></span>
                             <span>Logged on EC2: <strong>${escapeHtml(t.created_by_instance || 'N/A')}</strong> (${escapeHtml(t.created_by_az || 'N/A')})</span>
                         </div>
                     </div>
                     <div class="ticket-controls">
-                        <div class="quick-row">
-                            <select onchange="quickUpdateStatus(${t.id}, this.value)" title="Update Ticket Status">
-                                <option value="Open" ${t.status === 'Open' ? 'selected' : ''}>Status: Open</option>
-                                <option value="In Progress" ${t.status === 'In Progress' ? 'selected' : ''}>Status: In Progress</option>
-                                <option value="Resolved" ${t.status === 'Resolved' ? 'selected' : ''}>Status: Resolved</option>
-                            </select>
-                        </div>
-                        <div class="quick-row">
-                            <input type="text" value="${escapeHtml(t.assigned_to || 'Unassigned')}"
-                                onblur="quickAssignAgent(${t.id}, this.value)"
-                                placeholder="Assign agent..." title="Assign Support Agent" />
-                        </div>
-                        <div style="display:flex; gap:0.4rem;">
-                            <button class="btn-edit" onclick="startEditTicket(${t.id})">Edit</button>
-                            <button class="btn-danger" onclick="deleteTicket(${t.id})">Delete</button>
-                        </div>
+                        ${controlsHtml(t)}
                     </div>
                 </div>
                 `;
@@ -1115,9 +1234,6 @@ FRONTEND_HTML = """
             e.preventDefault();
             const editId = document.getElementById('edit-ticket-id').value;
             const payload = {
-                customer_name: document.getElementById('customer-name').value,
-                customer_email: document.getElementById('customer-email').value,
-                assigned_to: document.getElementById('assigned-to').value,
                 subject: document.getElementById('ticket-subject').value,
                 category: document.getElementById('ticket-category').value,
                 priority: document.getElementById('ticket-priority').value,
@@ -1137,6 +1253,9 @@ FRONTEND_HTML = """
                 resetForm();
                 await fetchTickets();
                 await pingHealth();
+            } else {
+                const err = await res.json().catch(() => ({}));
+                alert(err.error || 'Request failed');
             }
         }
 
@@ -1144,9 +1263,6 @@ FRONTEND_HTML = """
             const t = ticketsCache.find(item => item.id === id);
             if (!t) return;
             document.getElementById('edit-ticket-id').value = t.id;
-            document.getElementById('customer-name').value = t.customer_name;
-            document.getElementById('customer-email').value = t.customer_email;
-            document.getElementById('assigned-to').value = t.assigned_to || 'Unassigned';
             document.getElementById('ticket-subject').value = t.subject;
             document.getElementById('ticket-category').value = t.category;
             document.getElementById('ticket-priority').value = t.priority;
@@ -1160,7 +1276,6 @@ FRONTEND_HTML = """
         function resetForm() {
             document.getElementById('ticket-form').reset();
             document.getElementById('edit-ticket-id').value = '';
-            document.getElementById('assigned-to').value = 'Unassigned';
             document.getElementById('form-heading').textContent = 'Submit New Support Ticket';
             document.getElementById('submit-btn').textContent = 'Submit Support Ticket';
             document.getElementById('cancel-edit-btn').style.display = 'none';
@@ -1171,15 +1286,6 @@ FRONTEND_HTML = """
                 method: 'PATCH',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ status })
-            });
-            await fetchTickets();
-        }
-
-        async function quickAssignAgent(id, assigned_to) {
-            await fetch(`/api/tickets/${id}`, {
-                method: 'PATCH',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ assigned_to })
             });
             await fetchTickets();
         }
@@ -1213,24 +1319,136 @@ FRONTEND_HTML = """
 """
 
 
+LOGIN_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign in - Helpdesk Portal</title>
+    <style>
+        body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0;
+               min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+        .box { width: 100%; max-width: 380px; background: #1e293b; border: 1px solid #334155;
+               border-radius: 12px; padding: 1.6rem; }
+        h1 { font-size: 1.25rem; margin: 0 0 0.3rem; }
+        p.sub { color: #94a3b8; font-size: 0.85rem; margin: 0 0 1.2rem; }
+        .profiles { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; margin-bottom: 1rem; }
+        .profile { background: #0f172a; color: #cbd5e1; border: 1px solid #334155; border-radius: 8px;
+                   padding: 0.7rem 0.5rem; cursor: pointer; font-size: 0.95rem; font-weight: 600; }
+        .profile small { display: block; font-weight: 400; color: #94a3b8; font-size: 0.72rem; margin-top: 0.2rem; }
+        .profile.active { border-color: #38bdf8; background: #0c4a6e; color: #fff; }
+        label { display: block; font-size: 0.8rem; color: #94a3b8; margin-bottom: 0.3rem; }
+        input[type=password] { width: 100%; box-sizing: border-box; padding: 0.6rem; border-radius: 8px;
+                   border: 1px solid #334155; background: #0f172a; color: #e2e8f0; margin-bottom: 1rem; }
+        button.go { width: 100%; padding: 0.65rem; border: 0; border-radius: 8px; background: #0ea5e9;
+                    color: #fff; font-weight: 600; cursor: pointer; }
+        .err { background: #7f1d1d; color: #fecaca; padding: 0.55rem 0.7rem; border-radius: 8px;
+               font-size: 0.85rem; margin-bottom: 1rem; }
+        .meta { margin-top: 1rem; font-size: 0.72rem; color: #64748b; text-align: center; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h1>Cloud Helpdesk Portal</h1>
+        <p class="sub">Choose a profile and sign in</p>
+        {% if error %}<div class="err">{{ error }}</div>{% endif %}
+        <form method="post" action="/login">
+            <input type="hidden" name="username" id="username" value="{{ selected }}">
+            <div class="profiles">
+                <button type="button" class="profile" id="p-customer" onclick="pick('customer')">Customer<small>Submit and track tickets</small></button>
+                <button type="button" class="profile" id="p-support" onclick="pick('support')">Support<small>Manage all tickets</small></button>
+            </div>
+            <label for="password">Password</label>
+            <input type="password" name="password" id="password" required autocomplete="current-password">
+            <button type="submit" class="go">Sign in</button>
+        </form>
+        <div class="meta">Served by {{ instance_id }} ({{ az }})</div>
+    </div>
+    <script>
+        function pick(u) {
+            document.getElementById('username').value = u;
+            document.getElementById('p-customer').classList.toggle('active', u === 'customer');
+            document.getElementById('p-support').classList.toggle('active', u === 'support');
+        }
+        pick('{{ selected }}');
+    </script>
+</body>
+</html>
+"""
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+    selected = "customer"
+    status_code = 200
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip().lower()
+        password = request.form.get("password") or ""
+        if username in ("customer", "support"):
+            selected = username
+        try:
+            row = fetch_user(username)
+        except Exception as exc:
+            logger.error("Login lookup failed: %s", exc)
+            row = None
+            error = "Service temporarily unavailable. Please retry in a moment."
+            status_code = 503
+        if row and check_password_hash(row["password_hash"], password):
+            session.clear()
+            session.permanent = True
+            session.update(
+                uid=row["id"],
+                username=row["username"],
+                role=row["role"],
+                display_name=row["display_name"],
+                email=row["email"],
+            )
+            return redirect("/")
+        if not error:
+            error = "Invalid username or password."
+            status_code = 401
+    return render_template_string(
+        LOGIN_HTML,
+        error=error,
+        selected=selected,
+        instance_id=INSTANCE_META["instance_id"],
+        az=INSTANCE_META["availability_zone"],
+    ), status_code
+
+
+@app.route("/logout", methods=["GET"])
+def logout():
+    session.clear()
+    return redirect("/login")
+
+
+@app.route("/api/me", methods=["GET"])
+@api_auth()
+def api_me():
+    return jsonify(current_user()), 200
+
+
 @app.route("/", methods=["GET"])
 def index():
-    """Renders the Support Ticket / Helpdesk Portal UI along with EC2 instance metadata."""
+    """Renders the Helpdesk UI for the logged-in profile (customer or support)."""
+    user = current_user()
+    if not user:
+        return redirect("/login")
     return render_template_string(
         FRONTEND_HTML,
         instance_id=INSTANCE_META["instance_id"],
         availability_zone=INSTANCE_META["availability_zone"],
+        role=user["role"],
+        display_name=user["display_name"],
     )
 
 
 # ==============================================================================
 # 7. Application Entrypoint
 # ==============================================================================
-with app.app_context():
-    try:
-        init_db()
-    except Exception as exc:
-        logger.warning("Initial DB setup deferred until first request/health check: %s", exc)
+ensure_schema()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
