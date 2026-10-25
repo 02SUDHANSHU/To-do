@@ -3,7 +3,7 @@ import os
 import time
 import urllib.request
 
-eximport boto3
+import boto3
 import pymysql
 import pymysql.cursors
 from flask import Flask, jsonify, render_template, request
