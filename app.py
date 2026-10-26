@@ -3,7 +3,7 @@ Highly Available Support Ticket & Helpdesk Portal on AWS
 Backend: Python Flask + PyMySQL + Boto3 (AWS Secrets Manager)
 Features:
 - Role-based Support Ticket API (/api/tickets): customers submit/edit their own tickets, support updates status
-  and deletes; two login profiles (customer, support) with signed session cookies
+  and deletes; customer self-registration (/register) + username/password login (/login) with signed session cookies
 - Live Ticket Summary Metrics (Open, In Progress, Resolved, Critical counts)
 - Deep ALB Health Check Endpoint (/health) with RDS MySQL connectivity & latency check
 - Automatic Database Reconnection & Exponential Backoff Retry for RDS Multi-AZ Failover
@@ -13,6 +13,7 @@ Features:
 """
 
 import os
+import re
 import time
 import json
 import hashlib
@@ -47,6 +48,7 @@ app = Flask(__name__)
 VALID_STATUSES = ("Open", "In Progress", "Resolved")
 VALID_PRIORITIES = ("Low", "Medium", "High", "Critical")
 VALID_CATEGORIES = ("Billing", "Technical Support", "Account Access", "Feature Request", "Outage / Incident")
+USERNAME_RE = re.compile(r"^[a-z0-9_.-]{3,64}$")
 
 
 # ==============================================================================
@@ -110,8 +112,8 @@ def load_db_config():
 
     if secret_name and BOTO3_AVAILABLE:
         try:
-            session = boto3.session.Session()
-            client = session.client(service_name="secretsmanager", region_name=region_name)
+            boto_session = boto3.session.Session()
+            client = boto_session.client(service_name="secretsmanager", region_name=region_name)
             response = client.get_secret_value(SecretId=secret_name)
             secret = json.loads(response["SecretString"])
             logger.info("Loaded RDS credentials from AWS Secrets Manager (%s)", secret_name)
@@ -149,7 +151,7 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=8 * 3600,
 )
 
-# Two login profiles: (username, role, display name, email, password env var, demo default)
+# Default seeded profiles: (username, role, display name, email, password env var, demo default)
 DEMO_USERS = (
     ("customer", "customer", "Customer Demo", "customer@example.com", "CUSTOMER_PASSWORD", "Customer@123"),
     ("support", "support", "Support Agent", "support@example.com", "SUPPORT_PASSWORD", "Support@123"),
@@ -211,7 +213,7 @@ def with_db_retry(max_retries=3, base_delay=0.8):
 
 @with_db_retry(max_retries=5, base_delay=1.0)
 def init_db():
-    """Creates the helpdesk database and tickets table if they do not exist."""
+    """Creates the helpdesk database and tickets/users tables if they do not exist."""
     conn = pymysql.connect(
         host=DB_CONFIG["host"],
         user=DB_CONFIG["user"],
@@ -373,6 +375,39 @@ def fetch_user(username):
         conn.close()
 
 
+@with_db_retry()
+def create_customer_user(username, password, display_name, email):
+    """Creates a new customer account in the users table if username/email are available."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT username, email FROM users WHERE username = %s OR LOWER(email) = LOWER(%s) LIMIT 1;",
+                (username, email),
+            )
+            existing = cursor.fetchone()
+            if existing:
+                if existing["username"].lower() == username.lower():
+                    return None, "That username is already taken."
+                return None, "An account with that email address already exists."
+
+            pw_hash = generate_password_hash(password)
+            cursor.execute(
+                """
+                INSERT INTO users (username, password_hash, role, display_name, email)
+                VALUES (%s, %s, 'customer', %s, %s);
+                """,
+                (username, pw_hash, display_name, email),
+            )
+            user_id = cursor.lastrowid
+            conn.commit()
+
+            cursor.execute("SELECT * FROM users WHERE id = %s;", (user_id,))
+            return cursor.fetchone(), None
+    finally:
+        conn.close()
+
+
 @app.route("/health", methods=["GET"])
 def health_light():
     """ALB health check. Deliberately does NOT touch the DB, so an RDS failover
@@ -383,7 +418,7 @@ def health_light():
 @app.route("/health/db", methods=["GET"])
 def health_check():
     """
-    ALB Target Group Health Check Endpoint.
+    ALB Target Group / Dashboard Database Health Check Endpoint.
     Verifies both Flask process responsiveness and RDS MySQL reachability.
     Returns HTTP 200 when healthy, HTTP 503 if the database cannot be reached.
     """
@@ -1027,7 +1062,7 @@ FRONTEND_HTML = """
                 <p>Highly Available Multi-AZ Customer Support System on AWS (ALB + EC2 Auto Scaling + Multi-AZ RDS MySQL)</p>
             </div>
             <div style="display:flex; align-items:center; gap:0.6rem;">
-                <span class="badge">{{ display_name }} - <strong>{{ role|capitalize }}</strong></span>
+                <span class="badge">{{ display_name }} (@{{ username }}) - <strong>{{ role|capitalize }}</strong></span>
                 <a href="/logout" class="badge" style="text-decoration:none; color:inherit;">Log out</a>
             </div>
         </header>
@@ -1061,7 +1096,7 @@ FRONTEND_HTML = """
             </div>
             <form id="ticket-form" onsubmit="handleSaveTicket(event)">
                 <input type="hidden" id="edit-ticket-id" value="" />
-                <p style="margin:0 0 0.85rem; font-size:0.85rem; opacity:0.8;">Submitting as <strong>{{ display_name }}</strong></p>
+                <p style="margin:0 0 0.85rem; font-size:0.85rem; opacity:0.8;">Submitting as <strong>{{ display_name }}</strong> ({{ email }})</p>
                 <div class="form-grid-2">
                     <div>
                         <label>Ticket Subject *</label>
@@ -1327,52 +1362,104 @@ LOGIN_HTML = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Sign in - Helpdesk Portal</title>
     <style>
-        body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0;
-               min-height: 100vh; display: flex; align-items: center; justify-content: center; }
-        .box { width: 100%; max-width: 380px; background: #1e293b; border: 1px solid #334155;
-               border-radius: 12px; padding: 1.6rem; }
+        body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0;
+               min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1rem; }
+        .box { width: 100%; max-width: 400px; background: #1e293b; border: 1px solid #334155;
+               border-radius: 12px; padding: 1.65rem; }
         h1 { font-size: 1.25rem; margin: 0 0 0.3rem; }
-        p.sub { color: #94a3b8; font-size: 0.85rem; margin: 0 0 1.2rem; }
+        p.sub { color: #94a3b8; font-size: 0.85rem; margin: 0 0 1.15rem; }
         .profiles { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; margin-bottom: 1rem; }
         .profile { background: #0f172a; color: #cbd5e1; border: 1px solid #334155; border-radius: 8px;
                    padding: 0.7rem 0.5rem; cursor: pointer; font-size: 0.95rem; font-weight: 600; }
         .profile small { display: block; font-weight: 400; color: #94a3b8; font-size: 0.72rem; margin-top: 0.2rem; }
         .profile.active { border-color: #38bdf8; background: #0c4a6e; color: #fff; }
-        label { display: block; font-size: 0.8rem; color: #94a3b8; margin-bottom: 0.3rem; }
-        input[type=password] { width: 100%; box-sizing: border-box; padding: 0.6rem; border-radius: 8px;
-                   border: 1px solid #334155; background: #0f172a; color: #e2e8f0; margin-bottom: 1rem; }
-        button.go { width: 100%; padding: 0.65rem; border: 0; border-radius: 8px; background: #0ea5e9;
-                    color: #fff; font-weight: 600; cursor: pointer; }
+        label { display: block; font-size: 0.8rem; color: #94a3b8; margin-bottom: 0.3rem; font-weight: 600; }
+        input[type=text], input[type=email], input[type=password] {
+            width: 100%; box-sizing: border-box; padding: 0.62rem 0.75rem; border-radius: 8px;
+            border: 1px solid #334155; background: #0f172a; color: #e2e8f0; margin-bottom: 0.9rem; font-size: 0.92rem;
+        }
+        input:focus { outline: none; border-color: #38bdf8; }
+        button.go { width: 100%; padding: 0.68rem; border: 0; border-radius: 8px; background: #0ea5e9;
+                    color: #fff; font-weight: 600; cursor: pointer; font-size: 0.92rem; }
+        button.go:hover { background: #0284c7; }
         .err { background: #7f1d1d; color: #fecaca; padding: 0.55rem 0.7rem; border-radius: 8px;
                font-size: 0.85rem; margin-bottom: 1rem; }
+        .switch-row { margin-top: 1rem; text-align: center; font-size: 0.84rem; color: #94a3b8; }
+        .switch-row a { color: #38bdf8; text-decoration: none; font-weight: 600; }
+        .switch-row a:hover { text-decoration: underline; }
         .meta { margin-top: 1rem; font-size: 0.72rem; color: #64748b; text-align: center; }
     </style>
 </head>
 <body>
     <div class="box">
         <h1>Cloud Helpdesk Portal</h1>
-        <p class="sub">Choose a profile and sign in</p>
-        {% if error %}<div class="err">{{ error }}</div>{% endif %}
-        <form method="post" action="/login">
-            <input type="hidden" name="username" id="username" value="{{ selected }}">
-            <div class="profiles">
-                <button type="button" class="profile" id="p-customer" onclick="pick('customer')">Customer<small>Submit and track tickets</small></button>
-                <button type="button" class="profile" id="p-support" onclick="pick('support')">Support<small>Manage all tickets</small></button>
+        {% if mode == 'register' %}
+            <p class="sub">Create a new Customer account</p>
+            {% if error %}<div class="err">{{ error }}</div>{% endif %}
+            <form method="post" action="/register">
+                <label for="display_name">Full Name</label>
+                <input type="text" name="display_name" id="display_name" value="{{ form_display_name }}" placeholder="e.g. Alex Rivera" required autocomplete="name">
+
+                <label for="reg_username">Username</label>
+                <input type="text" name="username" id="reg_username" value="{{ form_username }}" placeholder="e.g. alex (3-64 letters/numbers)" required autocomplete="username">
+
+                <label for="email">Email Address</label>
+                <input type="email" name="email" id="email" value="{{ form_email }}" placeholder="e.g. alex@example.com" required autocomplete="email">
+
+                <label for="reg_password">Password</label>
+                <input type="password" name="password" id="reg_password" placeholder="At least 6 characters" required autocomplete="new-password">
+
+                <button type="submit" class="go">Create Customer Account</button>
+            </form>
+            <div class="switch-row">
+                Already have an account? <a href="/login">Sign in</a>
             </div>
-            <label for="password">Password</label>
-            <input type="password" name="password" id="password" required autocomplete="current-password">
-            <button type="submit" class="go">Sign in</button>
-        </form>
+        {% else %}
+            <p class="sub">Choose a profile or enter your username to sign in</p>
+            {% if error %}<div class="err">{{ error }}</div>{% endif %}
+            <form method="post" action="/login">
+                <input type="hidden" name="selected_role" id="selected_role" value="{{ selected }}">
+                <div class="profiles">
+                    <button type="button" class="profile" id="p-customer" onclick="pickRole('customer')">Customer<small>Submit and track tickets</small></button>
+                    <button type="button" class="profile" id="p-support" onclick="pickRole('support')">Support<small>Manage all tickets</small></button>
+                </div>
+                <label for="username">Username</label>
+                <input type="text" name="username" id="username" value="{{ form_username }}" placeholder="Enter username (e.g. customer or support)" required autocomplete="username">
+
+                <label for="password">Password</label>
+                <input type="password" name="password" id="password" required autocomplete="current-password">
+
+                <button type="submit" class="go">Sign in</button>
+            </form>
+            <div class="switch-row" id="register-link-row">
+                New customer? <a href="/register">Create a customer account</a>
+            </div>
+            <script>
+                function pickRole(role) {
+                    document.getElementById('selected_role').value = role;
+                    document.getElementById('p-customer').classList.toggle('active', role === 'customer');
+                    document.getElementById('p-support').classList.toggle('active', role === 'support');
+                    const userField = document.getElementById('username');
+                    if (role === 'support') {
+                        if (!userField.value || userField.value === 'customer') {
+                            userField.value = 'support';
+                        }
+                    } else {
+                        if (userField.value === 'support') {
+                            userField.value = 'customer';
+                        }
+                    }
+                }
+                // Highlight initial role button without overwriting custom typed username
+                (function initRole() {
+                    const initial = {{ selected|tojson }};
+                    document.getElementById('p-customer').classList.toggle('active', initial === 'customer');
+                    document.getElementById('p-support').classList.toggle('active', initial === 'support');
+                })();
+            </script>
+        {% endif %}
         <div class="meta">Served by {{ instance_id }} ({{ az }})</div>
     </div>
-    <script>
-        function pick(u) {
-            document.getElementById('username').value = u;
-            document.getElementById('p-customer').classList.toggle('active', u === 'customer');
-            document.getElementById('p-support').classList.toggle('active', u === 'support');
-        }
-        pick('{{ selected }}');
-    </script>
 </body>
 </html>
 """
@@ -1382,12 +1469,17 @@ LOGIN_HTML = """
 def login():
     error = None
     selected = "customer"
+    form_username = "customer"
     status_code = 200
     if request.method == "POST":
         username = (request.form.get("username") or "").strip().lower()
         password = request.form.get("password") or ""
-        if username in ("customer", "support"):
-            selected = username
+        selected_role = (request.form.get("selected_role") or "").strip().lower()
+        form_username = username
+        if selected_role in ("customer", "support"):
+            selected = selected_role
+        elif username == "support":
+            selected = "support"
         try:
             row = fetch_user(username)
         except Exception as exc:
@@ -1411,8 +1503,81 @@ def login():
             status_code = 401
     return render_template_string(
         LOGIN_HTML,
+        mode="login",
         error=error,
         selected=selected,
+        form_username=form_username,
+        form_display_name="",
+        form_email="",
+        instance_id=INSTANCE_META["instance_id"],
+        az=INSTANCE_META["availability_zone"],
+    ), status_code
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    """Allows a new customer to self-register an account and logs them in."""
+    error = None
+    form_username = ""
+    form_display_name = ""
+    form_email = ""
+    status_code = 200
+
+    if request.method == "POST":
+        form_display_name = (request.form.get("display_name") or "").strip()[:120]
+        form_username = (request.form.get("username") or "").strip().lower()
+        form_email = (request.form.get("email") or "").strip().lower()[:160]
+        password = request.form.get("password") or ""
+
+        if not form_display_name:
+            error = "Full name is required."
+            status_code = 400
+        elif not USERNAME_RE.match(form_username):
+            error = "Username must be 3-64 characters using lowercase letters, numbers, dots, hyphens, or underscores."
+            status_code = 400
+        elif form_username == "support":
+            error = "That username is reserved."
+            status_code = 400
+        elif "@" not in form_email or "." not in form_email.split("@")[-1]:
+            error = "Please enter a valid email address."
+            status_code = 400
+        elif len(password) < 6:
+            error = "Password must be at least 6 characters long."
+            status_code = 400
+        else:
+            try:
+                new_user, dup_err = create_customer_user(
+                    form_username, password, form_display_name, form_email
+                )
+                if dup_err:
+                    error = dup_err
+                    status_code = 409
+                elif new_user:
+                    session.clear()
+                    session.permanent = True
+                    session.update(
+                        uid=new_user["id"],
+                        username=new_user["username"],
+                        role=new_user["role"],
+                        display_name=new_user["display_name"],
+                        email=new_user["email"],
+                    )
+                    logger.info("Registered new customer username=%s on instance=%s",
+                                new_user["username"], INSTANCE_META["instance_id"])
+                    return redirect("/")
+            except Exception as exc:
+                logger.error("Customer registration failed: %s", exc)
+                error = "Service temporarily unavailable. Please retry in a moment."
+                status_code = 503
+
+    return render_template_string(
+        LOGIN_HTML,
+        mode="register",
+        error=error,
+        selected="customer",
+        form_username=form_username,
+        form_display_name=form_display_name,
+        form_email=form_email,
         instance_id=INSTANCE_META["instance_id"],
         az=INSTANCE_META["availability_zone"],
     ), status_code
@@ -1441,7 +1606,9 @@ def index():
         instance_id=INSTANCE_META["instance_id"],
         availability_zone=INSTANCE_META["availability_zone"],
         role=user["role"],
+        username=user["username"],
         display_name=user["display_name"],
+        email=user["email"],
     )
 
 
