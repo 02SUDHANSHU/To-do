@@ -1059,7 +1059,6 @@ FRONTEND_HTML = """
         <header>
             <div>
                 <h1>Cloud Support Ticket & Helpdesk Portal</h1>
-                <p>Highly Available Multi-AZ Customer Support System on AWS (ALB + EC2 Auto Scaling + Multi-AZ RDS MySQL)</p>
             </div>
             <div style="display:flex; align-items:center; gap:0.6rem;">
                 <span class="badge">{{ display_name }} (@{{ username }}) - <strong>{{ role|capitalize }}</strong></span>
